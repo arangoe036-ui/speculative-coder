@@ -22,7 +22,12 @@ from dataclasses import dataclass, field
 
 import torch
 
+from core.gates import SyntaxState
 from core.verifier import verify_tokens
+
+
+def _fmean(values: list[int]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
 @dataclass
@@ -38,6 +43,49 @@ class GenerationStats:
     seconds: float = 0.0
     accepted_per_iteration: list[int] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list, repr=False)
+
+    # Dual-gate telemetry. `draft_lengths` records the block length actually
+    # proposed each iteration, which under a fixed K is constant and under the
+    # dual gate is the whole point.
+    draft_lengths: list[int] = field(default_factory=list)
+    statistical_gate_triggers: int = 0
+    syntactic_gate_triggers: int = 0
+    syntactic_suppressed: int = 0   # fatal-looking states seen in prose, not enforced
+    ungated_iterations: int = 0     # ran to max_draft_len without either gate firing
+    # Per-iteration draft top-1 probabilities, paired positionally with
+    # accepted_per_iteration so a threshold can be calibrated against the
+    # acceptance it actually predicts. Only populated under the dual gate.
+    draft_confidences: list[list[float]] = field(default_factory=list, repr=False)
+
+    # Hybrid-cascade routing. A "draft" is one proposal block; the token counters
+    # are split by source because hit rate and acceptance rate are different
+    # questions -- a router can fire constantly and still propose badly.
+    ngram_drafts_used: int = 0
+    model_drafts_used: int = 0
+    ngram_tokens_proposed: int = 0
+    ngram_tokens_accepted: int = 0
+    model_tokens_proposed: int = 0
+    model_tokens_accepted: int = 0
+
+    # Monte Carlo branch telemetry. `branch_accepted` holds one list of per-branch
+    # acceptance counts per iteration, so the value of taking the max over B can be
+    # separated from the value of drafting at all.
+    branch_accepted: list[list[int]] = field(default_factory=list, repr=False)
+    branch_wins: list[int] = field(default_factory=list, repr=False)
+    # Particle filter: how many resampling steps ran, and how many *distinct*
+    # candidates survived to verification each iteration. The second number is the
+    # diagnostic for diversity collapse -- cloning that never re-diverges shows up
+    # here as a candidate count far below the particle count.
+    resample_steps: int = 0
+    unique_candidates: list[int] = field(default_factory=list, repr=False)
+    # Draft compute measured two ways. `draft_forwards` counts kernel launches;
+    # `draft_row_forwards` counts batch rows actually pushed through the draft
+    # model. The breadth engines make the same number of calls but at very
+    # different widths, so only the second number reflects real draft FLOPs --
+    # and since widening a batch is nearly free, the two tell different stories.
+    draft_row_forwards: int = 0
+    tree_splits: int = 0
+    leaf_counts: list[int] = field(default_factory=list, repr=False)
 
     @property
     def acceptance_rate(self) -> float:
@@ -62,6 +110,101 @@ class GenerationStats:
             return 0.0
         return self.tokens_generated / self.target_forwards
 
+    @property
+    def mean_draft_length(self) -> float:
+        """Average number of tokens actually proposed per iteration."""
+        return _fmean(self.draft_lengths)
+
+    @property
+    def gate_trigger_rate(self) -> float:
+        """Fraction of iterations stopped early by either gate."""
+        if self.iterations == 0:
+            return 0.0
+        return (self.statistical_gate_triggers + self.syntactic_gate_triggers) / self.iterations
+
+    @property
+    def ngram_share(self) -> float:
+        """Fraction of proposal blocks served by the n-gram fast path."""
+        total = self.ngram_drafts_used + self.model_drafts_used
+        return self.ngram_drafts_used / total if total else 0.0
+
+    @property
+    def ngram_acceptance_rate(self) -> float:
+        if self.ngram_tokens_proposed == 0:
+            return 0.0
+        return self.ngram_tokens_accepted / self.ngram_tokens_proposed
+
+    @property
+    def model_acceptance_rate(self) -> float:
+        if self.model_tokens_proposed == 0:
+            return 0.0
+        return self.model_tokens_accepted / self.model_tokens_proposed
+
+    @property
+    def mean_best_branch(self) -> float:
+        """Mean accepted count of the winning branch."""
+        return _fmean([max(row) for row in self.branch_accepted])
+
+    @property
+    def mean_single_branch(self) -> float:
+        """Mean accepted count of an arbitrary single branch.
+
+        The honest counterfactual for 'what would B=1 have achieved', measured on
+        the same draft samples rather than a separate run.
+        """
+        return _fmean([_fmean(row) for row in self.branch_accepted])
+
+    @property
+    def branch_gain(self) -> float:
+        """Extra accepted tokens per iteration bought by taking the max over B."""
+        return self.mean_best_branch - self.mean_single_branch
+
+    @property
+    def branch_win_spread(self) -> dict:
+        """How often each branch index won. A heavily skewed spread would mean the
+        branches are not really diverging."""
+        spread: dict[int, int] = {}
+        for w in self.branch_wins:
+            spread[w] = spread.get(w, 0) + 1
+        return dict(sorted(spread.items()))
+
+    @property
+    def mean_leaves(self) -> float:
+        """Average number of leaves a tree draft grew to."""
+        return _fmean(self.leaf_counts)
+
+    @property
+    def draft_rows_per_token(self) -> float:
+        """Draft batch-rows spent per emitted token -- the draft-side cost metric."""
+        if self.tokens_generated == 0:
+            return 0.0
+        return self.draft_row_forwards / self.tokens_generated
+
+    @property
+    def mean_unique_candidates(self) -> float:
+        """Distinct drafts reaching verification per iteration."""
+        return _fmean(self.unique_candidates)
+
+    def branch_summary(self) -> str:
+        return (
+            f"best branch {self.mean_best_branch:.2f} vs single "
+            f"{self.mean_single_branch:.2f} accepted/iteration "
+            f"(+{self.branch_gain:.2f} from breadth) | wins {self.branch_win_spread}"
+        )
+
+    def routing_summary(self) -> str:
+        """Human-readable hybrid-cascade routing telemetry."""
+        return (
+            f"n-gram {self.ngram_drafts_used} blocks ({self.ngram_share:.1%}), "
+            f"model {self.model_drafts_used} blocks | "
+            f"acceptance: n-gram {self.ngram_acceptance_rate:.1%} "
+            f"({self.ngram_tokens_accepted}/{self.ngram_tokens_proposed}), "
+            f"model {self.model_acceptance_rate:.1%} "
+            f"({self.model_tokens_accepted}/{self.model_tokens_proposed}) | "
+            f"{self.draft_forwards} draft forwards saved-vs-all-model: "
+            f"{self.ngram_tokens_proposed}"
+        )
+
     def summary(self) -> str:
         return (
             f"{self.tokens_generated} tokens in {self.seconds:.2f}s "
@@ -70,6 +213,17 @@ class GenerationStats:
             f"({self.draft_tokens_accepted}/{self.draft_tokens_proposed}) | "
             f"{self.iterations} iterations, {self.target_forwards} target forwards | "
             f"{self.speedup_vs_autoregressive:.2f} tokens per target forward"
+        )
+
+    def gate_summary(self) -> str:
+        """Human-readable dual-gate telemetry."""
+        return (
+            f"mean draft length {self.mean_draft_length:.2f} | "
+            f"statistical gate {self.statistical_gate_triggers}x, "
+            f"syntactic gate {self.syntactic_gate_triggers}x, "
+            f"ungated {self.ungated_iterations}x "
+            f"({self.gate_trigger_rate:.1%} of {self.iterations} iterations gated) | "
+            f"{self.syntactic_suppressed} syntax events suppressed in prose"
         )
 
 
@@ -136,6 +290,15 @@ class SpeculativeEngine:
         temperature: sampling temperature, applied identically to both models.
             ``0.0`` means greedy.
         top_p: nucleus threshold, applied identically to both models.
+        use_dual_gate: abandon the fixed ``k`` and let the draft run up to
+            ``max_draft_len``, short-circuiting early when either gate fires.
+        max_draft_len: ceiling on the adaptive draft length.
+        entropy_threshold: the statistical gate's floor on the draft's top-1
+            probability, read from the *unwarped* softmax. Below it, the draft is
+            judged unlikely to survive verification and drafting stops.
+
+    Neither gate can affect what the model emits -- they only choose the block
+    length, and ``verify_tokens`` is exact for any length. See :mod:`core.gates`.
 
     Attributes:
         vocab_size: the shared vocabulary width actually used for verification,
@@ -150,9 +313,18 @@ class SpeculativeEngine:
         k: int = 5,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        use_dual_gate: bool = False,
+        max_draft_len: int = 8,
+        entropy_threshold: float = 0.35,
     ):
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
+        if max_draft_len < 1:
+            raise ValueError(f"max_draft_len must be >= 1, got {max_draft_len}")
+        if not 0.0 <= entropy_threshold <= 1.0:
+            raise ValueError(
+                f"entropy_threshold is a probability in [0, 1], got {entropy_threshold}"
+            )
         if temperature < 0:
             raise ValueError(f"temperature must be >= 0, got {temperature}")
         if not 0 < top_p <= 1:
@@ -164,6 +336,9 @@ class SpeculativeEngine:
         self.k = k
         self.temperature = temperature
         self.top_p = top_p
+        self.use_dual_gate = use_dual_gate
+        self.max_draft_len = max_draft_len
+        self.entropy_threshold = entropy_threshold
 
         # Reconcile the two vocabularies.
         #
@@ -230,13 +405,19 @@ class SpeculativeEngine:
         """Sample one token id from a 1-D distribution."""
         return torch.multinomial(probs, num_samples=1)
 
-    def _forward(self, model, input_ids: torch.Tensor, cache):
+    def _forward(self, model, input_ids: torch.Tensor, cache, position_ids=None):
         """One forward pass that appends ``input_ids`` to an existing KV cache.
 
         ``attention_mask`` and ``cache_position`` are passed explicitly rather
         than inferred.  After a rollback the cache is shorter than the tokens
         already emitted, and letting transformers guess the offset is the classic
         source of silent off-by-one corruption in speculative decoding.
+
+        ``position_ids`` may be supplied to decouple RoPE from cache indexing.
+        They coincide whenever the cache holds a contiguous prefix starting at 0,
+        which is the case for every cache here except the windowed draft cache in
+        :class:`core.self_engine.SelfSpeculativeEngine` -- there the cache holds a
+        *suffix* of history, so its indices and the true positions differ.
         """
         cache_len = _cache_length(cache)
         total_len = cache_len + input_ids.shape[1]
@@ -249,18 +430,29 @@ class SpeculativeEngine:
                 (input_ids.shape[0], total_len), dtype=torch.long, device=input_ids.device
             ),
             cache_position=torch.arange(cache_len, total_len, device=input_ids.device),
+            position_ids=position_ids,
         )
         return outputs.logits, outputs.past_key_values
 
     # ---------------------------------------------------------------- phases
     @torch.no_grad()
-    def _draft(self, context: torch.Tensor, cache, k: int):
-        """Autoregressively propose ``k`` tokens with the draft model.
+    def _draft(self, context: torch.Tensor, cache, k: int, syntax=None):
+        """Autoregressively propose up to ``k`` tokens with the draft model.
 
-        Costs k sequential forwards -- this is the price speculative decoding
-        pays, and why the draft model has to be small.
+        Costs one sequential forward per proposed token -- this is the price
+        speculative decoding pays, and why the draft model has to be small. It is
+        also what the dual gate exists to reclaim: every token drafted after the
+        eventual first rejection is discarded, so drafting past the point where
+        the draft has plainly lost the thread is pure waste.
 
-        Returns ``(draft_tokens [k], q [k, V], cache, n_forwards)``.
+        With ``use_dual_gate`` the loop stops early when either gate fires. The
+        triggering token is *kept*, not dropped: the target scores the whole block
+        in one forward either way, so an extra doubtful token is free to verify
+        and might still be accepted, whereas dropping it can only lose a token.
+        What the gate saves is the *subsequent* draft forwards.
+
+        Returns ``(draft_tokens, q, cache, n_forwards, gates)`` where ``gates``
+        records which gate stopped the loop.
         """
         # Feed only what the cache has not seen yet.  On the first iteration that
         # is the whole prompt (prefill); afterwards it is the short tail left
@@ -270,21 +462,58 @@ class SpeculativeEngine:
         tokens: list[torch.Tensor] = []
         q_rows: list[torch.Tensor] = []
         forwards = 0
+        gates = {"statistical": 0, "syntactic": 0, "confidences": []}
 
         for _ in range(k):
             logits, cache = self._forward(self.draft_model, pending, cache)
             forwards += 1
-            probs = self._logits_to_probs(logits[0, -1])   # [V]
+            row = logits[0, -1]
+            probs = self._logits_to_probs(row)             # [V]
             token = self._sample(probs)                    # [1]
             tokens.append(token)
             q_rows.append(probs)
             # The freshly sampled token is the only pending input next time.
             pending = token.unsqueeze(0)                   # [1, 1]
 
+            if not self.use_dual_gate:
+                continue
+
+            # --- Gate 1: statistical (confidence) --------------------------
+            # Read the *unwarped* softmax, not `probs`. At temperature 0 `probs`
+            # is one-hot and its top-1 is always exactly 1.0, so a gate built on
+            # it would never fire in precisely the configuration benchmarked.
+            # Legitimate because the gate only chooses the block length; see
+            # core.gates for why that cannot disturb the output distribution.
+            confidence = float(
+                torch.softmax(row[: self.vocab_size].float(), dim=-1).max()
+            )
+            gates["confidences"].append(confidence)
+            if confidence < self.entropy_threshold:
+                gates["statistical"] = 1
+                break
+
+            # --- Gate 2: syntactic (bracket/quote state) -------------------
+            if syntax is not None:
+                piece = self.tokenizer.decode([int(token)], skip_special_tokens=True)
+                if syntax.feed(piece):
+                    gates["syntactic"] = 1
+                    break
+
         # Note the final sampled token was never fed to the draft model, so the
         # draft cache ends one position short of the drafted block. The
         # "feed whatever is pending" rule above absorbs that automatically.
-        return torch.cat(tokens), torch.stack(q_rows), cache, forwards
+        return torch.cat(tokens), torch.stack(q_rows), cache, forwards, gates
+
+    @torch.no_grad()
+    def _propose(self, context: torch.Tensor, cache, k: int, syntax=None):
+        """Produce a draft block. The one place a routing strategy plugs in.
+
+        Returns ``(tokens, q, cache, n_forwards, gates, source)``. ``source`` names
+        which drafter served the block, so telemetry can separate hit rate from
+        acceptance rate. The base engine always uses the draft model.
+        """
+        tokens, q, cache, forwards, gates = self._draft(context, cache, k, syntax)
+        return tokens, q, cache, forwards, gates, "model"
 
     @torch.no_grad()
     def _target_probs(self, context: torch.Tensor, draft_tokens: torch.Tensor, cache):
@@ -337,17 +566,29 @@ class SpeculativeEngine:
         generated: list[int] = []
         printed_chars = 0
         stats = GenerationStats()
+
+        # Bracket/quote state over the *committed* output only. Scoped to the
+        # generated text rather than the prompt: the chat template's control
+        # tokens are not source code, and the model starts its answer fresh.
+        syntax = SyntaxState() if self.use_dual_gate else None
+
         start = time.perf_counter()
 
         while len(generated) < max_new_tokens:
             context_len = context.shape[1]
-            # No point drafting further than the caller asked for.
-            k = min(self.k, max_new_tokens - len(generated))
+            # No point drafting further than the caller asked for. Under the dual
+            # gate this is only a ceiling; the gates decide the actual length.
+            budget = max_new_tokens - len(generated)
+            k = min(self.max_draft_len if self.use_dual_gate else self.k, budget)
 
-            # (a) draft k tokens with the small model
-            draft_tokens, q, draft_cache, n_draft_fwd = self._draft(
-                context, draft_cache, k
+            # (a) draft up to k tokens with the small model. The syntax tracker is
+            #     cloned, not shared: this block may be rejected, and a rejected
+            #     draft must not pollute the committed bracket state.
+            speculative_syntax = syntax.copy() if syntax is not None else None
+            draft_tokens, q, draft_cache, n_draft_fwd, gates, source = self._propose(
+                context, draft_cache, k, speculative_syntax
             )
+            n_drafted = draft_tokens.shape[0]
 
             # (b) one target forward over context + drafts -> p, including the
             #     k + 1-th row that grants the bonus token on full acceptance
@@ -359,9 +600,25 @@ class SpeculativeEngine:
             stats.iterations += 1
             stats.target_forwards += 1
             stats.draft_forwards += n_draft_fwd
-            stats.draft_tokens_proposed += k
+            stats.draft_row_forwards += n_draft_fwd
+            stats.draft_tokens_proposed += n_drafted
             stats.draft_tokens_accepted += n_accepted
             stats.accepted_per_iteration.append(n_accepted)
+            stats.draft_lengths.append(n_drafted)
+            if source == "ngram":
+                stats.ngram_drafts_used += 1
+                stats.ngram_tokens_proposed += n_drafted
+                stats.ngram_tokens_accepted += n_accepted
+            else:
+                stats.model_drafts_used += 1
+                stats.model_tokens_proposed += n_drafted
+                stats.model_tokens_accepted += n_accepted
+            stats.statistical_gate_triggers += gates["statistical"]
+            if gates["confidences"]:
+                stats.draft_confidences.append(gates["confidences"])
+            stats.syntactic_gate_triggers += gates["syntactic"]
+            if self.use_dual_gate and not (gates["statistical"] or gates["syntactic"]):
+                stats.ungated_iterations += 1
 
             # Trim to the caller's budget: full acceptance emits k + 1 tokens,
             # one more than we drafted for.
@@ -377,6 +634,12 @@ class SpeculativeEngine:
 
             generated.extend(new_ids)
             stats.tokens_generated = len(generated)
+
+            # Advance the committed bracket state over exactly the tokens that
+            # survived. The speculative clone is discarded: whatever the draft
+            # imagined past the rejection point never existed.
+            if syntax is not None and new_ids:
+                syntax.feed(self.tokenizer.decode(new_ids, skip_special_tokens=True))
 
             # (e) stream. Decode the whole suffix and print only the delta: a
             # single BPE token can be half a UTF-8 character or half a word, so
@@ -424,6 +687,11 @@ class SpeculativeEngine:
 
         stats.seconds = time.perf_counter() - start
         stats.token_ids = list(generated)
+        if syntax is not None:
+            # Reported so the cost of enforcing brackets only inside ``` fences is
+            # measurable: these are states the gate would have called fatal in
+            # prose, where "1)" and ":)" are ordinary English rather than errors.
+            stats.syntactic_suppressed = syntax.suppressed
         if stream:
             print(flush=True)
 

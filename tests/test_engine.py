@@ -28,7 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformers import Qwen2Config, Qwen2ForCausalLM  # noqa: E402
 
-from core.engine import SpeculativeEngine, _cache_length, _crop_cache  # noqa: E402
+from core.engine import (  # noqa: E402
+    SpeculativeEngine,
+    _cache_length,
+    _crop_cache,
+    _fmean,
+)
+from core.gates import SyntaxState  # noqa: E402
 
 VOCAB = 16
 PROMPT = "cbadcbad"
@@ -487,3 +493,226 @@ def test_reconciled_greedy_matches_target_over_shared_prefix(tokenizer):
 
     text, _ = engine.generate(PROMPT, max_new_tokens=12, stream=False)
     assert [ord(c) - ord("a") for c in text] == expected
+
+
+# ==========================================================================
+# Dual-gated adaptive drafting
+# ==========================================================================
+class BracketTokenizer(CharTokenizer):
+    """Decodes every token to a closing paren, so the syntactic gate can fire."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        return ")" * len(list(ids))
+
+
+def test_dual_gate_preserves_greedy_output(models, tokenizer):
+    """The whole point: adaptive drafting must not change what is emitted.
+
+    Gating chooses the block length from the *draft's* state alone, and
+    verify_tokens is exact for any length, so greedy output must still match
+    plain greedy decoding on the target. Swept from a threshold that never fires
+    to one that fires on every token -- if any of those changed the output, the
+    gate would be reading something it must not.
+    """
+    draft, target = models
+    expected = reference_greedy(target, tokenizer(PROMPT).input_ids, 24)
+
+    for threshold in (0.0, 0.05, 0.35, 1.0):
+        engine = SpeculativeEngine(
+            draft, target, tokenizer, temperature=0.0,
+            use_dual_gate=True, max_draft_len=8, entropy_threshold=threshold,
+        )
+        actual = _generated_ids(engine, tokenizer, PROMPT, 24)
+        assert actual == expected, (
+            "dual gate changed the output at entropy_threshold={}\n"
+            "  expected: {}\n  actual  : {}".format(threshold, expected, actual)
+        )
+
+
+def test_dual_gate_matches_static_k_output(models, tokenizer):
+    """Adaptive and static drafting must agree token for token."""
+    draft, target = models
+    static = SpeculativeEngine(draft, target, tokenizer, k=5, temperature=0.0)
+    adaptive = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=8, entropy_threshold=0.35,
+    )
+    assert (_generated_ids(adaptive, tokenizer, PROMPT, 24)
+            == _generated_ids(static, tokenizer, PROMPT, 24))
+
+
+def test_threshold_zero_never_gates(models, tokenizer):
+    """A floor of 0 cannot be undercut, so blocks run to max_draft_len."""
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=6, entropy_threshold=0.0,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=24, stream=False)
+    assert stats.statistical_gate_triggers == 0
+    assert stats.ungated_iterations == stats.iterations
+    # Every block hits the ceiling except possibly the last, clamped by budget.
+    assert all(n == 6 for n in stats.draft_lengths[:-1]), stats.draft_lengths
+    assert stats.mean_draft_length == pytest.approx(_fmean(stats.draft_lengths))
+
+
+def test_threshold_one_gates_every_token(models, tokenizer):
+    """A floor of 1.0 is unreachable, so every block stops after one token.
+
+    The degenerate end of the adaptive range, which must still be correct: a
+    one-token block is a legal block.
+    """
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=8, entropy_threshold=1.0,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=20, stream=False)
+    assert set(stats.draft_lengths) == {1}
+    assert stats.statistical_gate_triggers == stats.iterations
+    assert stats.ungated_iterations == 0
+    assert stats.mean_draft_length == pytest.approx(1.0)
+
+
+def test_statistical_gate_reads_the_unwarped_softmax(models, tokenizer):
+    """At temperature 0 the warped q is one-hot, so a gate built on it is dead.
+
+    The subtlest part of the design. `_logits_to_probs` returns a one-hot
+    distribution at temperature 0, whose top-1 probability is always exactly 1.0.
+    A confidence gate reading that would never fire in precisely the
+    configuration the benchmark uses, and would look indistinguishable from a
+    gate that simply never triggers.
+    """
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=8, entropy_threshold=0.9,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=20, stream=False)
+    assert stats.statistical_gate_triggers > 0, (
+        "gate never fired at temperature 0 -- it is reading the warped one-hot q"
+    )
+
+
+def test_max_draft_len_is_the_ceiling(models, tokenizer):
+    draft, target = models
+    for ceiling in (1, 2, 4, 8):
+        engine = SpeculativeEngine(
+            draft, target, tokenizer, temperature=0.0,
+            use_dual_gate=True, max_draft_len=ceiling, entropy_threshold=0.0,
+        )
+        _, stats = engine.generate(PROMPT, max_new_tokens=16, stream=False)
+        assert max(stats.draft_lengths) <= ceiling
+        assert all(n >= 1 for n in stats.draft_lengths), "a block is never empty"
+
+
+def test_gates_ignore_k_when_enabled(models, tokenizer):
+    """use_dual_gate replaces k with max_draft_len; a stale k must not leak in."""
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, k=2, temperature=0.0,
+        use_dual_gate=True, max_draft_len=7, entropy_threshold=0.0,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=21, stream=False)
+    assert max(stats.draft_lengths) == 7, "k=2 should be ignored under the gate"
+
+
+def test_syntactic_gate_fires_and_keeps_the_triggering_token():
+    """A fatal bracket state stops the block, with the bad token retained.
+
+    Retaining it is deliberate: the target scores the whole block in one forward
+    either way, so a doubtful token is free to verify and may still be accepted,
+    while dropping it can only lose a token. What the gate buys is skipping the
+    *remaining* draft forwards.
+    """
+    target = _tiny_model(1234)
+    draft = _perturbed_model(target, scale=0.02, seed=7)
+    engine = SpeculativeEngine(
+        draft, target, BracketTokenizer(), temperature=0.0,
+        use_dual_gate=True, max_draft_len=8, entropy_threshold=0.0,
+    )
+
+    state = SyntaxState()
+    state.feed("```python\n")           # inside code, empty bracket stack
+    context = BracketTokenizer()(PROMPT).input_ids
+
+    tokens, q, _, forwards, gates = engine._draft(context, None, 8, state)
+
+    assert gates["syntactic"] == 1 and gates["statistical"] == 0
+    assert tokens.shape[0] == 1, "stops immediately, keeping the bad token"
+    assert q.shape[0] == 1
+    assert forwards == 1, "the remaining 7 draft forwards were skipped"
+    assert state.fatal
+
+
+def test_syntactic_gate_silent_outside_code_fences():
+    """The same token in prose is not an error and must not gate."""
+    target = _tiny_model(1234)
+    draft = _perturbed_model(target, scale=0.02, seed=7)
+    engine = SpeculativeEngine(
+        draft, target, BracketTokenizer(), temperature=0.0,
+        use_dual_gate=True, max_draft_len=4, entropy_threshold=0.0,
+    )
+    state = SyntaxState()               # never entered a fence
+    context = BracketTokenizer()(PROMPT).input_ids
+
+    tokens, _, _, forwards, gates = engine._draft(context, None, 4, state)
+
+    assert gates["syntactic"] == 0
+    assert tokens.shape[0] == 4 and forwards == 4
+    assert state.suppressed == 4, "counted rather than enforced"
+
+
+def test_rejected_draft_does_not_pollute_committed_syntax_state(models, tokenizer):
+    """The tracker must be cloned per block, not shared.
+
+    A draft that hits a fatal bracket state is usually rejected. Had the
+    committed tracker absorbed it, every later iteration would see a fatal state
+    and the gate would jam permanently at draft length 1.
+    """
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=6, entropy_threshold=0.0,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=30, stream=False)
+    assert stats.draft_lengths[-1] >= 1
+    assert max(stats.draft_lengths) == 6, "gate jammed: blocks collapsed"
+
+
+def test_telemetry_is_recorded_per_iteration(models, tokenizer):
+    draft, target = models
+    engine = SpeculativeEngine(
+        draft, target, tokenizer, temperature=0.0,
+        use_dual_gate=True, max_draft_len=8, entropy_threshold=0.5,
+    )
+    _, stats = engine.generate(PROMPT, max_new_tokens=24, stream=False)
+
+    assert len(stats.draft_lengths) == stats.iterations
+    assert sum(stats.draft_lengths) == stats.draft_tokens_proposed
+    triggered = stats.statistical_gate_triggers + stats.syntactic_gate_triggers
+    assert triggered + stats.ungated_iterations == stats.iterations
+    assert 0.0 <= stats.gate_trigger_rate <= 1.0
+    assert "mean draft length" in stats.gate_summary()
+
+
+def test_static_mode_leaves_gate_telemetry_empty(models, tokenizer):
+    """Without the gate, counters stay zero but draft_lengths is still filled."""
+    draft, target = models
+    engine = SpeculativeEngine(draft, target, tokenizer, k=5, temperature=0.0)
+    _, stats = engine.generate(PROMPT, max_new_tokens=24, stream=False)
+    assert stats.statistical_gate_triggers == 0
+    assert stats.syntactic_gate_triggers == 0
+    assert stats.ungated_iterations == 0, "not applicable when the gate is off"
+    assert set(stats.draft_lengths) <= {5, 4, 3, 2, 1}
+    assert stats.gate_trigger_rate == 0.0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_draft_len": 0}, {"max_draft_len": -1},
+    {"entropy_threshold": -0.1}, {"entropy_threshold": 1.5},
+])
+def test_invalid_gate_arguments(models, tokenizer, kwargs):
+    draft, target = models
+    with pytest.raises(ValueError):
+        SpeculativeEngine(draft, target, tokenizer, use_dual_gate=True, **kwargs)
