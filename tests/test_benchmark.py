@@ -95,13 +95,13 @@ def _synthetic_results() -> list[RunResult]:
     results = []
     for prompt_id, _ in PROMPTS:
         results.append(RunResult(
-            prompt_id=prompt_id, method="baseline", k=None, seconds=10.0, tokens=200,
+            prompt_id=prompt_id, variant="baseline", k=None, seconds=10.0, tokens=200,
             target_forwards=200, alpha=None, peak_gib=11.0, correctness="PASS",
             complete=True, text="same",
         ))
         for k in K_SWEEP:
             results.append(RunResult(
-                prompt_id=prompt_id, method="spec", k=k, seconds=10.0 / (1 + k / 10),
+                prompt_id=prompt_id, variant="static", k=k, seconds=10.0 / (1 + k / 10),
                 tokens=200, target_forwards=200 // max(1, k), alpha=0.5 + k / 100,
                 peak_gib=11.1, correctness="PASS", complete=True, identical=True,
                 text="same",
@@ -132,6 +132,98 @@ def test_build_report_is_wellformed_markdown():
         assert len(widths) == 1, f"ragged table:\n{block}"
 
 
+def test_aggregate_table_includes_every_configuration_row():
+    """Each configuration must actually appear as a row, baseline included.
+
+    Added after a real miss: `variant` and `method` briefly both encoded the
+    baseline/spec distinction, and a baseline built without `variant` was
+    classified as a static-K run. That silently dropped the baseline row from the
+    aggregate table while every existing test still passed, because they only
+    checked that section *headings* were present.
+    """
+    report = build_report(_synthetic_results(), CONFIG)
+    aggregate = report.split("## Speedup by prompt")[0]
+    assert "| Baseline (7B only)" in aggregate, "baseline row missing"
+    for k in K_SWEEP:
+        assert f"| Speculative K={k}" in aggregate, f"K={k} row missing"
+
+
+def _with_dual_gate(results, threshold=0.35):
+    """Append a dual-gate run per prompt to a synthetic result set."""
+    for prompt_id, _ in PROMPTS:
+        results.append(RunResult(
+            prompt_id=prompt_id, variant="dual_gate", k=None, seconds=8.0,
+            tokens=200, target_forwards=34, alpha=0.72, peak_gib=11.1,
+            correctness="PASS", complete=True, identical=True, text="same",
+            mean_draft_len=5.9, entropy_threshold=threshold,
+            gate={"statistical": 7, "syntactic": 2, "ungated": 25,
+                  "suppressed": 3, "iterations": 34, "trigger_rate": 9 / 34},
+        ))
+    return results
+
+
+def test_dual_gate_appears_in_every_table():
+    report = build_report(_with_dual_gate(_synthetic_results()), CONFIG)
+    assert "Adaptive Dual-Gate (Max K=8, t=0.35)" in report
+    # Per-prompt tables use the compact header.
+    assert "Gate t=0.35" in report.split("## Speedup by prompt")[1]
+    assert "## Dual-gate telemetry" in report
+
+
+def test_dual_gate_telemetry_reports_counts_and_a_total():
+    report = build_report(_with_dual_gate(_synthetic_results()), CONFIG)
+    section = report.split("## Dual-gate telemetry")[1].split("## Full results")[0]
+    assert "Statistical" in section and "Syntactic" in section
+    assert "Suppressed" in section
+    assert "**total**" in section, "a totals row makes the section readable at a glance"
+    # 10 prompts x 7 statistical triggers, and x 34 iterations.
+    assert "70" in section and "340" in section
+
+
+def test_dual_gate_can_win_best_configuration():
+    """The winner is whichever configuration is fastest, not hardcoded to a K."""
+    results = _synthetic_results()
+    for prompt_id, _ in PROMPTS:
+        results.append(RunResult(
+            prompt_id=prompt_id, variant="dual_gate", k=None, seconds=2.0,
+            tokens=200, target_forwards=30, alpha=0.8, peak_gib=11.1,
+            correctness="PASS", complete=True, text="same", mean_draft_len=6.0,
+            entropy_threshold=0.65,
+            gate={"statistical": 1, "syntactic": 0, "ungated": 29,
+                  "suppressed": 0, "iterations": 30, "trigger_rate": 1 / 30},
+        ))
+    report = build_report(results, CONFIG)
+    summary = report.split("## Summary")[1]
+    assert "Adaptive Dual-Gate" in summary, "fastest configuration should win"
+
+
+def test_report_omits_dual_gate_sections_when_not_run():
+    """--no-dual-gate must not leave empty scaffolding behind."""
+    report = build_report(_synthetic_results(), CONFIG)
+    assert "## Dual-gate telemetry" not in report
+    assert "Dual-Gate" not in report and "Gate t=" not in report
+
+
+def test_multiple_thresholds_each_get_their_own_row_and_section():
+    """Several adaptive configurations must stay distinguishable in every table.
+
+    They share a baseline and static sweep within one run, so the only thing
+    separating them in the report is the threshold.
+    """
+    results = _with_dual_gate(_synthetic_results(), threshold=0.35)
+    results = _with_dual_gate(results, threshold=0.65)
+    report = build_report(results, CONFIG)
+
+    for threshold in ("0.35", "0.65"):
+        assert f"Adaptive Dual-Gate (Max K=8, t={threshold})" in report
+        assert f"Gate t={threshold}" in report
+        assert f"### Threshold t = {threshold}" in report
+
+    # Two adaptive rows in the aggregate table, not one collapsed row.
+    aggregate = report.split("## Speedup by prompt")[0]
+    assert aggregate.count("Adaptive Dual-Gate") == 2
+
+
 def test_build_report_computes_speedup_against_matching_prompt():
     """Speedup must be per-prompt, not against a global mean.
 
@@ -142,8 +234,8 @@ def test_build_report_computes_speedup_against_matching_prompt():
         RunResult("slow", "baseline", None, 20.0, 200, 200, None, 11.0, "PASS", True, text="x"),
         RunResult("fast", "baseline", None, 5.0, 200, 200, None, 11.0, "PASS", True, text="x"),
         # Each is exactly 2x its own baseline.
-        RunResult("slow", "spec", 5, 10.0, 200, 40, 0.8, 11.1, "PASS", True, True, "x"),
-        RunResult("fast", "spec", 5, 2.5, 200, 40, 0.8, 11.1, "PASS", True, True, "x"),
+        RunResult("slow", "static", 5, 10.0, 200, 40, 0.8, 11.1, "PASS", True, True, "x"),
+        RunResult("fast", "static", 5, 2.5, 200, 40, 0.8, 11.1, "PASS", True, True, "x"),
     ]
     report = build_report(results, CONFIG)
     assert "2.00x" in report
@@ -196,7 +288,7 @@ def test_build_report_survives_missing_determinism_data():
 
 
 def test_run_result_derived_metrics():
-    r = RunResult("x", "spec", 5, 4.0, 200, 40, 0.75, 11.0, "PASS", True)
+    r = RunResult("x", "static", 5, 4.0, 200, 40, 0.75, 11.0, "PASS", True)
     assert r.tok_s == pytest.approx(50.0)
     assert r.tokens_per_forward == pytest.approx(5.0)
     assert r.label == "Speculative K=5"
