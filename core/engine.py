@@ -86,6 +86,11 @@ class GenerationStats:
     draft_row_forwards: int = 0
     tree_splits: int = 0
     leaf_counts: list[int] = field(default_factory=list, repr=False)
+    # Jacobi relaxation: sweeps spent per block, and how often a block reached a
+    # true fixed point rather than hitting the iteration cap. Convergence rate is
+    # the whole story for this method, since every sweep costs a full forward.
+    jacobi_iterations: list[int] = field(default_factory=list, repr=False)
+    jacobi_fixed_points: int = 0
 
     @property
     def acceptance_rate(self) -> float:
@@ -167,6 +172,18 @@ class GenerationStats:
         for w in self.branch_wins:
             spread[w] = spread.get(w, 0) + 1
         return dict(sorted(spread.items()))
+
+    @property
+    def mean_jacobi_iterations(self) -> float:
+        """Mean relaxation sweeps per block."""
+        return _fmean(self.jacobi_iterations)
+
+    @property
+    def jacobi_convergence_rate(self) -> float:
+        """Fraction of blocks that reached a true fixed point before the cap."""
+        if not self.jacobi_iterations:
+            return 0.0
+        return self.jacobi_fixed_points / len(self.jacobi_iterations)
 
     @property
     def mean_leaves(self) -> float:
