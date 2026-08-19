@@ -1,0 +1,18 @@
+# Pinned to the environment the published figures were measured in:
+# Windows 11 · Python 3.12.10 · NVIDIA RTX 5080 (16 GB) · CUDA 12.9
+#
+# ⚠ A bare `torch` pin resolves to the CPU wheel and leaves a modern card
+# completely idle. Install torch from the CUDA index FIRST, then the rest:
+#
+#     pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu129
+#     pip install -r requirements.txt
+#
+torch==2.9.0
+transformers==5.15.0
+accelerate==1.14.0
+bitsandbytes==0.50.1
+safetensors==0.8.0
+tokenizers==0.22.2
+huggingface_hub==1.28.0
+numpy==2.5.2
+pytest==9.1.1
