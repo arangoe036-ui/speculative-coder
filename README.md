@@ -2,11 +2,12 @@
 
 A from-scratch PyTorch speculative decoding engine. **2.39x faster local inference
 on a 7B code model, with the output distribution provably unchanged** — and a
-documented record of the four ideas that didn't work and the mechanism that killed
+documented record of the five ideas that didn't work and the mechanism that killed
 each one.
 
 No `vllm`, no `assistant_model=`. The rejection sampler, the generation loop, the
-KV-cache rollback, and six speculation strategies are implemented and tested here.
+KV-cache rollback, seven speculation strategies and a trained Medusa ablation are
+implemented and tested here.
 
 ---
 
@@ -26,6 +27,11 @@ RTX 5080 (16 GB). Target `Qwen2.5-Coder-7B-Instruct` in 8-bit; draft
 `Alpha` is the fraction of drafted tokens accepted. `7B fwd/token` counts forward
 passes of the *expensive* model per emitted token — plain decoding is 1.00 by
 definition. `Draft rows/token` counts draft-model batch rows, the draft-side cost.
+
+The two champions are the **Evolutionary Tree (2.39x)** for research and the
+**Adaptive Dual-Gate (2.21x)** for deployment. Everything else built in this project
+was measured and rejected; see [the graveyard](#4-the-falsified-graveyard), which now
+includes a trained Medusa ablation that lost to both.
 
 Every configuration is **distribution-preserving**: emitted tokens are exactly
 what the target model would have produced. That is verified, not asserted — see
@@ -139,8 +145,9 @@ construction, so the verification batch is rectangular with **no padding require
 
 ## 4. The Falsified Graveyard
 
-Four ideas were built, measured, and rejected. Each is kept in the repository with
-its telemetry, because the mechanism that killed it is the useful part.
+Five ideas were built, measured, and rejected -- one of them through an actual
+training run. Each is kept in the repository with its telemetry, because the
+mechanism that killed it is the useful part.
 
 ### Twin-Cache Self-Speculation — 0.65x *(35% slower than baseline)*
 
@@ -183,18 +190,96 @@ acceptance is decided by the target. Overhead was not the problem: per-iteration
 was identical (215 vs 216 ms); the entire deficit was fewer tokens committed per
 iteration.
 
+### Unconditional Multi-Token Prediction (AST / 6K Medusa) — 1.86x *(trained)*
+
+M lightweight heads bolted onto the frozen 7B, each predicting the token *i*
+positions ahead directly from the final hidden state `h_t`. **Killed by the chain
+product of an unconditional prediction.**
+
+This one was pursued furthest — through two architecture revisions and an actual
+training run — because each stage fixed the previous stage's blocker and revealed a
+deeper one.
+
+**Revision 1, AST-restricted heads: 1.87x ceiling.** Restricting the heads to
+structural tokens (keywords, punctuation, indentation) capped acceptance at
+*coverage*: a head that can only emit `def` and `:` cannot propose an identifier, and
+structural tokens **interleave** rather than cluster. Measured on 1,155 tokens of real
+generated code, consecutive structural runs averaged **0.87** with **54.3% of
+positions accepting nothing at all**, and the longest run in the corpus was 7 of 15.
+
+**Revision 2, top-6K frequency mask: 5.69x ceiling.** Widening the mask from "syntax"
+to "the 6,000 most frequent code tokens" did solve interleaving. Coverage rose 44% →
+84.5%, mean run 0.79 → **4.69**, dead positions 56% → 15%, and 24.3% of positions
+reached the full M=10. Coverage stopped being the binding constraint.
+
+**Revision 3, the training run: 1.86x measured.** Coverage only says a proposal is
+*permitted*. Training M=10 heads on 400k tokens against the base model's own greedy
+tokens gave this accuracy curve on held-out generated code:
+
+| Head | Predicts | Accuracy | **Chain** |
+|---:|---|---:|---:|
+| 1 | t+1 | 65.5% | **65.5%** |
+| 2 | t+2 | 27.7% | **18.1%** |
+| 3 | t+3 | 10.9% | **2.0%** |
+| 4 | t+4 | 5.3% | 0.1% |
+| 5–10 | t+5…t+10 | 3.7% → 1.1% | 0.0% |
+
+A step commits the longest **all-correct prefix**, so accuracies multiply. The chain
+falls below 1% at head 4: **effective M is 3, not 10**, and heads 4–10 are 320 MiB of
+parameters contributing nothing measurable.
+
+**The conditioning deficit is the mechanism.** Every head projects from the *same*
+`h_t`, with no autoregressive feedback — head 2 must predict `t+2` without ever seeing
+what `t+1` turned out to be. That is a categorically harder problem than one-step
+prediction, and it shows up as the 65.5% → 27.7% cliff between heads 1 and 2. The
+Evolutionary Tree beats this precisely because its 0.5B drafter *does* condition on
+intervening tokens: 6 ms per forward buys information that 0.9 ms of unconditional
+heads cannot.
+
+**Capacity is provably not the constraint.** A rank-256 bottleneck head (**38M
+params**) matched the full linear head (**402M params**) to within **0.01x** on both
+eval sets — 1.85x vs 1.86x on generated code, 2.39x vs 2.38x on library Python. Ten
+times the parameters bought nothing. The ceiling is the information content of `h_t`,
+not the width of the projection.
+
+Head 1 doubles as the pipeline's own control: it distils the base `lm_head`, a linear
+map from the very same vector, so it bounds what the approach can achieve. Its
+ceiling is the single-token mask coverage of 84.5%, and it reached 65.5% — the
+shortfall splitting into a data limit (93.5% train → 79.8% held-out library) and a
+domain shift (79.8% library → 65.5% chat-generated). Fixing both is worth arithmetic
+rather than a training run: lifting head 1 to its full 84.5% while leaving the rest
+measured gives **2.11x**, and the physically impossible case where *every* head
+matched head 1 gives **2.87x**. Both land at or below the Evolutionary Tree that is
+already shipping, untrained.
+
+Two notes for anyone revisiting this. A full-vocabulary head is `3584 × 152064` =
+545M parameters, so **M=15 of them is 15.2 GiB and cannot be instantiated** alongside
+the 8.1 GiB base on a 16 GB card; the AST restriction's real payoff was making the
+projection factorable (26x smaller, mathematically identical, verified to 2.26e-08).
+And the measurement is easy to fake: ranking token frequency on the evaluation corpus
+itself reports **10.95x instead of 5.69x**, because 1,000 tokens of generated code
+contain only 351 distinct types and all of them fit inside a 6,000-token budget. The
+ranking and evaluation corpora are kept disjoint, and a test pins the trap.
+
+If the cheap-head idea is worth another attempt, the variant to try is **EAGLE, not
+Medusa**: feed head *i* the previous head's predicted embedding so it conditions on
+its own lookahead. That attacks the `t+2` collapse, which is the actual failure —
+rather than the mask, the parameter count, or the head count, none of which were.
+
 ### Also measured and rejected
 
 - **Static K sweep.** K=5 is the best fixed choice (2.08x), but the per-prompt
   optimum moves between K=5 and K=7 with acceptance — the argument for adapting K.
 - **1.5B draft.** Identical throughput to the 0.5B draft (30.2 vs 30.1 tok/s) for
   **1.95 GiB more VRAM**. The smaller draft is strictly better here.
+- **M=10 Medusa heads.** Heads 4–10 contribute under 0.1% to the acceptance chain.
+  Any revival should use M=2–3 and spend the freed budget on head quality.
 
 ---
 
 ## Correctness
 
-**281 tests pass.** The guarantee is that emitted tokens are distributed exactly as
+**362 tests pass.** The guarantee is that emitted tokens are distributed exactly as
 the target model would have sampled them, and it is checked at three levels.
 
 **The mathematics.** 10,000-run Monte Carlo goodness-of-fit (per-category z-test,
@@ -247,7 +332,7 @@ Every load-bearing invariant was mutation-tested. Some findings:
   a guard test that fails if acceptance drifts out of the mixed range.
 
 ```bash
-python -m pytest tests/ -v      # 281 passed
+python -m pytest tests/ -v      # 362 passed
 ```
 
 ---
@@ -298,6 +383,10 @@ python benchmark.py --entropy-thresholds 0.65              # the deployment cham
 python exactness_check.py     # fp32/bf16/int8 bitwise-exactness sweep
 python gate_calibration.py    # calibrate the entropy gate against measured acceptance
 python batch_scaling.py       # measure whether widening the batch is actually free
+
+python benchmark_medusa_limit.py     # 15 tokens sequentially vs through M heads
+python benchmark_6k_medusa_limit.py  # coverage ceiling vs mask size
+python train_medusa_heads.py         # train the heads, print the accuracy curve
 ```
 
 `--no-eos` forces every configuration to emit exactly `--max-new-tokens`. Without it,
@@ -318,9 +407,13 @@ higher early in a generation than late — which flatters whichever run ends soo
 | `core/particle_filter_engine.py` | Resampled particles *(falsified)*. |
 | `core/hybrid_engine.py`, `core/ngram.py` | CPU n-gram fast path *(falsified)*. |
 | `core/self_engine.py` | Twin-Cache self-speculation *(falsified)*. |
+| `core/ast_medusa.py` | Frozen base + M factored lookahead heads *(falsified)*. |
+| `core/medusa_train.py` | Head training, per-head accuracy, chain projection. |
 | `benchmark.py` | 10-prompt sweep across every configuration. |
 | `cli.py` | Interactive streaming REPL. |
 | `exactness_check.py`, `gate_calibration.py`, `batch_scaling.py` | Diagnostics. |
+| `benchmark_medusa_limit.py`, `benchmark_6k_medusa_limit.py` | Medusa ceilings. |
+| `train_medusa_heads.py` | Trains the heads and reports the accuracy curve. |
 
 Each iteration, in all engines: draft → verify in one target forward → modified
 rejection sampling → roll both KV caches back to the accepted prefix. The rollback is
@@ -341,6 +434,10 @@ silent off-by-one corruption.
   index different token spaces.
 - **Bitwise exactness needs fp32.** With a quantized target, treat the engine as
   distribution-preserving up to that precision. Throughput is unaffected.
+- **Unconditional lookahead does not work here.** Medusa-style heads are cheaper
+  than any drafter (0.9 ms for all 15) but must predict without seeing intervening
+  tokens, and the chain product collapses by head 3. Conditioning is worth more than
+  cheapness; that is why a 0.5B drafter beats free heads.
 - **The draft is now the bottleneck for breadth.** Monte Carlo spends ~23.8k draft
   rows to save ~160 target forwards. The tree cuts that 3.1x, which is the direction
   further work should go: cheaper drafts, not smarter proposals.
