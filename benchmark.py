@@ -48,6 +48,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from core.engine import SpeculativeEngine
 from core.hybrid_engine import HybridCascadeEngine
+from core.jacobi_engine import JacobiEngine
+from core.latent_tree_engine import LatentTreeEngine, load_extrapolator_head
 from core.monte_carlo_engine import MonteCarloEngine
 from core.particle_filter_engine import ParticleFilterEngine
 from core.tree_engine import TreeSpeculativeEngine
@@ -62,6 +64,11 @@ DUAL_GATE_MAX_DRAFT = 8
 # percentile and almost never fires. Both are run so the difference is visible
 # rather than argued.
 DUAL_GATE_THRESHOLDS = (0.35, 0.65)
+LATENT_MAX_LEAVES = 16
+LATENT_SPLIT_THRESHOLD = 0.85
+LATENT_K = 8
+JACOBI_BLOCKS = (10,)
+JACOBI_MAX_ITERATIONS = 5
 TREE_SPLIT_THRESHOLDS = (0.8,)
 TREE_MAX_LEAVES = 8
 TREE_K = 8
@@ -175,6 +182,9 @@ class RunResult:
     weights_gib: float = 0.0
     branches: int | None = None               # monte carlo / particle filter
     survivor_fraction: float | None = None    # particle filter runs only
+    max_leaves: int | None = None             # latent mitosis runs only
+    block_size: int | None = None             # jacobi runs only
+    jacobi: dict | None = None                # jacobi convergence telemetry
     split_threshold: float | None = None      # tree runs only
     tree: dict | None = None                  # tree shape telemetry
     draft_rows: int = 0                       # draft batch rows pushed
@@ -205,6 +215,12 @@ class RunResult:
         if self.variant == "tree":
             return (f"Evolutionary Tree (leaves<={TREE_MAX_LEAVES}, K={self.k}, "
                     f"split<{self.split_threshold:g})")
+        if self.variant == "jacobi":
+            return (f"Speculative Jacobi (block={self.block_size}, "
+                    f"max_iter={JACOBI_MAX_ITERATIONS})")
+        if self.variant == "latent_tree":
+            return (f"Latent Mitosis Tree (EAGLE-2, leaves<={self.max_leaves}, "
+                    f"K={self.k}, split<{self.split_threshold:g})")
         return f"Speculative K={self.k}"
 
     @property
@@ -224,6 +240,10 @@ class RunResult:
             return f"PF keep={self.survivor_fraction:g}"
         if self.variant == "tree":
             return f"Tree s<{self.split_threshold:g}"
+        if self.variant == "jacobi":
+            return f"Jacobi B={self.block_size}"
+        if self.variant == "latent_tree":
+            return f"Latent L={self.max_leaves}"
         return f"K={self.k}"
 
     @property
@@ -338,6 +358,15 @@ def _configurations(results: list[RunResult]) -> list[tuple[str, list[RunResult]
         group = [r for r in results if r.variant == "tree"
                  and r.split_threshold == threshold]
         groups.append((group[0].label, group))
+    for block in sorted({r.block_size for r in results if r.variant == "jacobi"}):
+        group = [r for r in results
+                 if r.variant == "jacobi" and r.block_size == block]
+        groups.append((group[0].label, group))
+    for leaves in sorted({r.max_leaves for r in results
+                          if r.variant == "latent_tree"}):
+        group = [r for r in results
+                 if r.variant == "latent_tree" and r.max_leaves == leaves]
+        groups.append((group[0].label, group))
     self_spec = [r for r in results if r.variant == "self_spec"]
     if self_spec:
         groups.append((self_spec[0].label, self_spec))
@@ -363,6 +392,11 @@ def _spec_columns(results: list[RunResult]) -> list[tuple[str, str]]:
     for threshold in sorted({r.split_threshold for r in results
                              if r.variant == "tree"}):
         columns.append((f"Tree s<{threshold:g}", f"tree:{threshold}"))
+    for block in sorted({r.block_size for r in results if r.variant == "jacobi"}):
+        columns.append((f"Jacobi B={block}", f"jacobi:{block}"))
+    for leaves in sorted({r.max_leaves for r in results
+                          if r.variant == "latent_tree"}):
+        columns.append((f"Latent L={leaves}", f"latent:{leaves}"))
     if any(r.variant == "self_spec" for r in results):
         columns.append(("Self-Spec", "self"))
     return columns
@@ -374,6 +408,14 @@ def _find(results: list[RunResult], prompt_id: str, key: str) -> RunResult | Non
             continue
         if key == "self" and r.variant == "self_spec":
             return r
+        if key.startswith("latent:") and r.variant == "latent_tree":
+            if r.max_leaves == int(key.split(":")[1]):
+                return r
+            continue
+        if key.startswith("jacobi:") and r.variant == "jacobi":
+            if r.block_size == int(key.split(":")[1]):
+                return r
+            continue
         if key.startswith("tree:") and r.variant == "tree":
             if r.split_threshold == float(key.split(":")[1]):
                 return r
@@ -613,11 +655,50 @@ def build_report(results: list[RunResult], config: dict) -> str:
         lines.append(_table(headers, rows))
         lines.append("")
 
+    # ---- jacobi convergence telemetry ----
+    jacobi_blocks = sorted({r.block_size for r in results
+                            if r.variant == "jacobi" and r.jacobi})
+    if jacobi_blocks:
+        lines.append("## Jacobi convergence")
+        lines.append("")
+        lines.append(
+            "Every relaxation sweep costs one full target forward, so `sweeps/block` "
+            "against `tokens/block` is the entire economics: the method wins only when "
+            "a block freezes in fewer sweeps than it yields tokens. `Converged` is the "
+            "share of blocks that reached a true fixed point rather than hitting the "
+            "iteration cap. `Seeds` splits the initial guess between the n-gram lookup "
+            "and the fallback of repeating the last token."
+        )
+        lines.append("")
+        headers = ["Config", "Blocks", "Sweeps/block", "Tokens/block", "Tok/fwd",
+                   "Converged", "n-gram seeds", "Tok/s", "Speedup"]
+        rows = []
+        for block in jacobi_blocks:
+            group = [r for r in results if r.variant == "jacobi"
+                     and r.block_size == block and r.jacobi]
+            blocks_total = sum(r.jacobi["blocks"] for r in group)
+            tokens_total = sum(r.tokens for r in group)
+            seeds = sum(r.jacobi["ngram_seeds"] for r in group)
+            rows.append([
+                f"block={block}",
+                str(blocks_total),
+                f"{_mean([r.jacobi['sweeps'] for r in group]):.2f}",
+                f"{tokens_total / max(1, blocks_total):.2f}",
+                f"{_mean([r.tokens_per_forward for r in group]):.2f}",
+                f"{_mean([r.jacobi['converged'] for r in group]):.0%}",
+                f"{seeds / max(1, blocks_total):.0%}",
+                f"{_mean([r.tok_s for r in group]):.1f}",
+                f"{_mean([speedup(r) for r in group]):.2f}x",
+            ])
+        lines.append(_table(headers, rows))
+        lines.append("")
+
     # ---- tree shape telemetry ----
+    latent_runs = [r for r in results if r.variant == "latent_tree" and r.tree]
     tree_thresholds = sorted({r.split_threshold for r in results
                               if r.variant == "tree" and r.tree})
-    if tree_thresholds:
-        lines.append("## Evolutionary tree telemetry")
+    if tree_thresholds or latent_runs:
+        lines.append("## Tree telemetry: token-space vs latent-space mitosis")
         lines.append("")
         lines.append(
             "`Leaves` is the mean width the tree grew to, against a ceiling of "
@@ -647,6 +728,21 @@ def build_report(results: list[RunResult], config: dict) -> str:
                 f"{_mean([r.tokens_per_forward for r in group]):.2f}",
                 f"{_mean([r.tok_s for r in group]):.1f}",
                 f"{_mean([speedup(r) for r in group]):.2f}x",
+            ])
+        if latent_runs:
+            rows.append([
+                f"Latent Mitosis (leaves<={latent_runs[0].max_leaves})",
+                str(sum(r.tree["iterations"] for r in latent_runs)),
+                f"{_mean([r.tree['leaves'] for r in latent_runs]):.2f}",
+                str(sum(r.tree["splits"] for r in latent_runs)),
+                str(sum(r.draft_rows for r in latent_runs)),
+                f"{_mean([r.draft_rows_per_token for r in latent_runs]):.2f}",
+                f"{_mean([r.branch['best'] for r in latent_runs if r.branch]):.2f}"
+                if any(r.branch for r in latent_runs) else "--",
+                "--",
+                f"{_mean([r.tokens_per_forward for r in latent_runs]):.2f}",
+                f"{_mean([r.tok_s for r in latent_runs]):.1f}",
+                f"{_mean([speedup(r) for r in latent_runs]):.2f}x",
             ])
         if reference:
             rows.append([
@@ -730,7 +826,8 @@ def build_report(results: list[RunResult], config: dict) -> str:
     for prompt_id, _ in PROMPTS:
         group = [r for r in results if r.prompt_id == prompt_id]
         order = {"baseline": 0, "static": 1, "dual_gate": 2, "hybrid": 3,
-                 "monte_carlo": 4, "particle_filter": 5, "tree": 6, "self_spec": 7}
+                 "monte_carlo": 4, "particle_filter": 5, "tree": 6, "jacobi": 7,
+                 "latent_tree": 8, "self_spec": 9}
         group.sort(key=lambda r: (order[r.variant], r.k or 0))
         for r in group:
             rows.append([
@@ -1066,6 +1163,16 @@ def run_speculative(engine, prompt: str, args, variant: str | None = None) -> Ru
         branches=getattr(engine, "branches", getattr(engine, "particles", None)),
         survivor_fraction=getattr(engine, "survivor_fraction", None),
         split_threshold=getattr(engine, "split_threshold", None),
+        block_size=getattr(engine, "block_size", None),
+        max_leaves=getattr(engine, "max_leaves", None),
+        jacobi=({
+            "sweeps": stats.mean_jacobi_iterations,
+            "converged": stats.jacobi_convergence_rate,
+            "fixed_points": stats.jacobi_fixed_points,
+            "blocks": stats.iterations,
+            "ngram_seeds": stats.ngram_drafts_used,
+            "repeat_seeds": stats.model_drafts_used,
+        } if stats.jacobi_iterations else None),
         draft_rows=stats.draft_row_forwards,
         tree=({
             "leaves": stats.mean_leaves,
@@ -1127,6 +1234,18 @@ def main() -> int:
     parser.add_argument("--self-spec-window", type=int, default=SELF_SPEC_WINDOW,
                         help="draft KV-cache window for the single-model engine")
     parser.add_argument("--self-spec-k", type=int, default=SELF_SPEC_K)
+    parser.add_argument("--latent-head", default=None,
+                        help="path to a trained ExtrapolatorHead checkpoint; enables "
+                             "the Latent Mitosis configuration")
+    parser.add_argument("--latent-max-leaves", type=int, default=LATENT_MAX_LEAVES)
+    parser.add_argument("--latent-k", type=int, default=LATENT_K)
+    parser.add_argument("--latent-split-threshold", type=float,
+                        default=LATENT_SPLIT_THRESHOLD)
+    parser.add_argument("--jacobi-blocks", type=int, nargs="*",
+                        default=list(JACOBI_BLOCKS),
+                        help="Jacobi block sizes to sweep. Pass none to skip")
+    parser.add_argument("--jacobi-max-iterations", type=int,
+                        default=JACOBI_MAX_ITERATIONS)
     parser.add_argument("--tree-split-thresholds", type=float, nargs="*",
                         default=list(TREE_SPLIT_THRESHOLDS),
                         help="tree split thresholds to sweep; a branch splits when its "
@@ -1213,10 +1332,13 @@ def main() -> int:
                   for mc_k in (args.mc_ks or [])]
     pf_fractions = list(args.pf_survivor_fractions or [])
     tree_thresholds = list(args.tree_split_thresholds or [])
+    jacobi_blocks = list(args.jacobi_blocks or [])
     n_two_model = (len(static_ks) + len(match_lens) + len(mc_configs) + len(pf_fractions)
                    + len(tree_thresholds)
                    + (0 if args.no_dual_gate else len(args.entropy_thresholds)))
-    total_runs = len(prompts) * (1 + n_two_model + (0 if args.no_self_spec else 1))
+    n_latent = 1 if args.latent_head else 0
+    total_runs = len(prompts) * (1 + n_two_model + len(jacobi_blocks) + n_latent
+                                 + (0 if args.no_self_spec else 1))
     print(f"\nRunning {total_runs} generations over {len(prompts)} prompts")
     print(f"Sampling: {'greedy' if args.temperature == 0 else f'temp={args.temperature}'}, "
           f"budget {args.max_new_tokens} tokens"
@@ -1241,6 +1363,30 @@ def main() -> int:
     print(f"\n{'=' * 78}")
     print("PHASE 1  target only -- baseline and single-model Twin-Cache")
     print(f"{'=' * 78}")
+    jacobi_engines = {
+        block: JacobiEngine(
+            target_model, tokenizer, block_size=block,
+            max_iterations=args.jacobi_max_iterations,
+            temperature=args.temperature, top_p=args.top_p,
+        )
+        for block in jacobi_blocks
+    }
+    latent_engine = None
+    if args.latent_head:
+        print(f"Loading extrapolator head: {args.latent_head}")
+        head = load_extrapolator_head(args.latent_head, device="cuda:0")
+        latent_engine = LatentTreeEngine(
+            target_model, tokenizer, head,
+            k=args.latent_k, max_leaves=args.latent_max_leaves,
+            split_threshold=args.latent_split_threshold,
+            temperature=args.temperature, top_p=args.top_p,
+        )
+        torch.cuda.synchronize()
+        head_params = sum(p.numel() for p in head.parameters())
+        print(f"  head: {head_params / 1e6:.1f}M params "
+              f"({head_params * 4 / 2**20:.0f} MiB fp32); "
+              f"VRAM now {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
+
     self_engine = None
     if not args.no_self_spec:
         self_engine = SelfSpeculativeEngine(
@@ -1250,6 +1396,10 @@ def main() -> int:
         )
     print("Warming up...")
     warmup_target()
+    for engine in jacobi_engines.values():
+        engine.generate(warm, max_new_tokens=24, stream=False)
+    if latent_engine is not None:
+        latent_engine.generate(warm, max_new_tokens=24, stream=False)
     if self_engine is not None:
         self_engine.generate(warm, max_new_tokens=24, stream=False)
     torch.cuda.synchronize()
@@ -1266,6 +1416,29 @@ def main() -> int:
         results.append(base)
         print(f"{base.seconds:6.2f}s  {base.tok_s:5.1f} tok/s  {base.tokens:>3} tok  "
               f"{base.correctness}")
+
+        if latent_engine is not None:
+            run_index += 1
+            print(f"[{run_index:>2}/{total_runs}] {prompt_id:<11} latent-tree  ",
+                  end="", flush=True)
+            run = run_speculative(latent_engine, templated, args,
+                                  variant="latent_tree")
+            run.weights_gib = vram_target_only
+            t = run.tree
+            note(run, base, "latent",
+                 f"  leaves={t['leaves']:.2f} splits={t['splits']} "
+                 f"tok/fwd={run.tokens_per_forward:.2f}")
+
+        for block, engine in jacobi_engines.items():
+            run_index += 1
+            print(f"[{run_index:>2}/{total_runs}] {prompt_id:<11} "
+                  f"jacobi B={block:<5}", end="", flush=True)
+            run = run_speculative(engine, templated, args, variant="jacobi")
+            run.weights_gib = vram_target_only
+            j = run.jacobi
+            note(run, base, "jacobi",
+                 f"  sweeps={j['sweeps']:.2f} conv={j['converged']:.0%} "
+                 f"ngram={j['ngram_seeds']}/{j['blocks']}")
 
         if self_engine is not None:
             run_index += 1
@@ -1433,8 +1606,20 @@ def main() -> int:
     # The verification vocabulary is the shared prefix of both models' output
     # widths. With only the target loaded there is nothing to intersect, so it is
     # the target's own width.
-    any_engine = next(iter(list(engines.values()) + list(dual_engines.values())), None)
-    vocab_width = (any_engine or self_engine).vocab_size
+    # Any engine knows the shared verification width. Every collection has to be
+    # considered: a run may skip the two-model configurations entirely, in which
+    # case only the single-model engines exist.
+    candidates = (
+        list(engines.values()) + list(dual_engines.values())
+        + list(hybrid_engines.values()) + list(mc_engines.values())
+        + list(pf_engines.values()) + list(tree_engines.values())
+        + list(jacobi_engines.values()) + ([self_engine] if self_engine else [])
+        + ([latent_engine] if latent_engine else [])
+    )
+    if not candidates:
+        print("No speculative configuration selected; nothing to report.")
+        return 1
+    vocab_width = candidates[0].vocab_size
 
     determinism = None
     if args.temperature == 0:
