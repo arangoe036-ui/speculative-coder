@@ -1,16 +1,27 @@
-# Speculative-Coder: Empirical Limits of Local Inference & Modified Rejection Sampling
+# Speculative-Coder — 2.40× faster local inference, provably lossless
 
-A from-scratch PyTorch speculative decoding engine, and an empirical study of the
-seven architectures built around it.
+**13.6 → 32.7 tok/s on a 7B code model on a single RTX 5080, emitting exactly the tokens
+the target model would have sampled.** No `vllm`, no `assistant_model=`. The modified
+rejection sampler, the generation loop, the KV-cache rollback, twelve speculation
+strategies, two training runs and five diagnostic harnesses are implemented from scratch
+and covered by 451 tests.
 
-**2.40x faster local inference on a 7B code model, with the output distribution
-provably unchanged** — plus six documented dead ends, each with the measured mechanism
-that killed it. The negative results are the larger contribution: they map where the
-physics of batch-1 local inference actually binds.
+The winning design drafts a **single** branch and splits it only where the drafter is
+unsure — certainty costs one batch row, uncertainty costs two. It reaches the highest
+measured throughput here on **3.1× less draft compute** than fixed-width parallel
+drafting, at higher acceptance.
 
-No `vllm`, no `assistant_model=`. The rejection sampler, the generation loop, the
-KV-cache rollback, seven speculation strategies, two training runs and five diagnostic
-harnesses are implemented and tested here.
+**Losslessness is verified, not asserted.** A 10,000-run Monte Carlo goodness-of-fit on
+the rejection sampler, an *independent* full-recompute greedy oracle that every engine
+must match token for token, and a precision sweep reported as measured — fp32 5/5
+bitwise identical, bf16 4/5, int8 2/5. The standard implementation bug in this
+algorithm, resampling from `p` instead of the residual, is caught at **20σ** — so the
+test is proven able to fail.
+
+Twelve architectures were built and measured; eight of them lost. Each is
+[mapped with the mechanism that ruled it out](#the-design-space-what-does-not-work),
+which is *why* the 2.40× is trustworthy: the champion won against every alternative I
+could build, not against no alternative at all.
 
 ---
 
@@ -112,11 +123,12 @@ would never fire — indistinguishable from a gate that found nothing.
 
 ---
 
-## The Graveyard of Falsified Physics
+## The Design Space: What Does Not Work
 
-Six architectures were built, measured, and rejected. Each is kept in the repository
-with its telemetry, because the mechanism is the useful part. Two required training
-runs to kill.
+Eight of the twelve architectures lost, in the six post-mortems below. Each stays in the
+repository with its telemetry, because the mechanism is the reusable part — together they
+map where batch-1 local inference actually binds. Two of them took full training runs to
+rule out.
 
 ### 1. Twin-Cache Self-Speculation — 0.65x
 **Failed: batch-1 weight-bandwidth dominance.**
@@ -288,7 +300,7 @@ exactly what the target would.
 
 ## What the study shows
 
-Seven architectures triangulate one conclusion. Sorting them by what they supply:
+Sorted by what each one supplies, the architectures triangulate a single conclusion:
 
 | Architecture | Lookahead | Conditioning | Result |
 |---|---|---|---|

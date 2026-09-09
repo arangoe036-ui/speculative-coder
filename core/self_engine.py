@@ -43,7 +43,7 @@ the draft structurally cheaper (skipping layers, early exit, extra lightweight
 heads) rather than merely shortening its context.
 
 This module implements and measures the design as specified; see
-benchmark_results_selfspec.md for what it actually does on real hardware.
+results/benchmark_results_selfspec.md for what it actually does on real hardware.
 """
 
 from __future__ import annotations

@@ -1219,7 +1219,7 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0.0 (default) is greedy and makes runs comparable and reproducible")
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--output", default="benchmark_results.md")
+    parser.add_argument("--output", default="results/benchmark_results.md")
     parser.add_argument("--limit", type=int, default=None, help="use only the first N prompts")
     parser.add_argument("--max-draft-len", type=int, default=DUAL_GATE_MAX_DRAFT,
                         help="ceiling on the adaptive draft length")
